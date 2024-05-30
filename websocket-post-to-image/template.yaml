@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  websocket-post-to-image
+
+  Sample SAM Template for websocket-post-to-image
+
+Parameters:
+  OpenAIApiKey:
+    Type: String
+    Description: "OpenAI API Key"
+
+Resources:
+  PostToImageEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: PostToImageEventBus
+
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: WebSocketApi
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target: !Join
+        - "/"
+        - - "integrations"
+          - !Ref ConnectIntegration
+
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      Description: Connect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConnectFunction.Arn}/invocations
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target: !Join
+        - "/"
+        - - "integrations"
+          - !Ref DisconnectIntegration
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      Description: Disconnect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DisconnectFunction.Arn}/invocations
+
+  GenerateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: generate
+      AuthorizationType: NONE
+      OperationName: GenerateRoute
+      Target: !Join
+        - "/"
+        - - "integrations"
+          - !Ref GenerateIntegration
+
+  GenerateIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      Description: forward Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EventBridgeProxyFunction.Arn}/invocations
+
+  ConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: bootstrap
+      Runtime: provided.al2023
+      CodeUri: connect/
+
+  ConnectPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - WebSocketApi
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ConnectFunction
+      Principal: apigateway.amazonaws.com
+
+  DisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: bootstrap
+      Runtime: provided.al2023
+      CodeUri: disconnect/
+
+  DisconnectPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - WebSocketApi
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DisconnectFunction
+      Principal: apigateway.amazonaws.com
+
+  EventBridgeProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: bootstrap
+      Runtime: provided.al2023
+      CodeUri: eventbridge-proxy/
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref PostToImageEventBus
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${PostToImageEventBus}"
+
+  EventBridgeProxyPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - WebSocketApi
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref EventBridgeProxyFunction
+      Principal: apigateway.amazonaws.com
+
+  ImageUploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-image-upload-bucket"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+              - GET
+            AllowedOrigins:
+              - "*"
+            ExposedHeaders: []
+
+  ImageUploadBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImageUploadBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${AWS::StackName}-image-upload-bucket/*"
+
+  PromptPreparationAPIFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: bootstrap
+      Runtime: provided.al2023
+      CodeUri: prepare-prompt/
+      Timeout: 60
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - comprehend:DetectSentiment
+                - comprehend:DetectKeyPhrases
+              Resource: "*"
+
+  DalleImageGenerationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: bootstrap
+      Runtime: provided.al2023
+      CodeUri: generate-image-dalle/
+      Timeout: 30
+      Environment:
+        Variables:
+          OPENAI_API_KEY: !Ref OpenAIApiKey
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+  BedrockImageGenerationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: bootstrap
+      Runtime: provided.al2023
+      CodeUri: generate-image-bedrock/
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ImageUploadBucket
+          REGION: !Ref AWS::Region
+          WEBSOCKET_API_ENDPOINT: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/production"
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - "bedrock:InvokeModel"
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - "execute-api:ManageConnections"
+              Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/POST/@connections/*"
+
+  ImageUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: bootstrap
+      Runtime: provided.al2023
+      CodeUri: upload-image/
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref ImageUploadBucket
+          REGION: !Ref AWS::Region
+          WEBSOCKET_API_ENDPOINT: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/production"
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - "execute-api:ManageConnections"
+              Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/POST/@connections/*"
+
+  PostToImageStateMachine:
+    Type: "AWS::Serverless::StateMachine"
+    Properties:
+      Definition:
+        StartAt: PromptPreparation
+        States:
+          PromptPreparation:
+            Type: Task
+            Resource: !GetAtt PromptPreparationAPIFunction.Arn
+            Next: CheckBedRock
+          CheckBedRock:
+            Type: Choice
+            Choices:
+              - Variable: "$.bedrock"
+                BooleanEquals: true
+                Next: BedrockImageGeneration
+            Default: DalleImageGeneration
+          BedrockImageGeneration:
+            Type: Task
+            Resource: !GetAtt BedrockImageGenerationFunction.Arn
+            End: true
+          DalleImageGeneration:
+            Type: Task
+            Resource: !GetAtt DalleImageGenerationFunction.Arn
+            Next: ImageUpload
+          ImageUpload:
+            Type: Task
+            Resource: !GetAtt ImageUploadFunction.Arn
+            End: true
+      Role: !GetAtt PostToImageStateMachineRole.Arn
+
+  PostToImageStateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "StateMachineExecutionPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt PromptPreparationAPIFunction.Arn
+                  - !GetAtt DalleImageGenerationFunction.Arn
+                  - !GetAtt ImageUploadFunction.Arn
+                  - !GetAtt BedrockImageGenerationFunction.Arn
+              - Effect: Allow
+                Action:
+                  - "states:StartExecution"
+                  - "states:DescribeExecution"
+                  - "states:StopExecution"
+                Resource: "*"
+
+  StateMachineEventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: !Ref PostToImageEventBus
+      EventPattern:
+        source:
+          - "api-gateway"
+        detail-type:
+          - "PreparePrompt"
+      Targets:
+        - Arn: !GetAtt PostToImageStateMachine.Arn
+          Id: "PostToImageStateMachineTarget"
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+      State: "ENABLED"
+
+  EventBridgeExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "events.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "EventBridgeStepFunctionsExecutionPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "states:StartExecution"
+                Resource: !GetAtt PostToImageStateMachine.Arn
+
+Outputs:
+  WebSocketApiUrl:
+    Description: "WebSocket API URL"
+    Value: !Sub wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com

@@ -1,0 +1,5 @@
+.env
+.DS_Store
+.aws-sam/
+node_modules/
+samconfig.toml
